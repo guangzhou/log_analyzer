@@ -1,6 +1,9 @@
 # logsys/db.py
 """
-提供 Database 类以兼容 logsys.main 的导入，同时保留批量 upsert 与调优工具函数。
+Database 兼容层：
+- 保留 Database 类以兼容 from .db import Database
+- init_db 与 execute_script 均可接受 文件路径 或 原始 SQL 文本
+- 内置 SQLite PRAGMA 调优
 """
 
 from __future__ import annotations
@@ -17,38 +20,58 @@ __all__ = [
 ]
 
 class Database:
-    """
-    轻量级 SQLite 包装，兼容 `from .db import Database` 的旧用法。
-
-    常用属性与方法：
-    - conn: sqlite3.Connection 实例
-    - init_db(schema_path: Optional[str]): 执行建表脚本（默认寻找仓库根目录的 schema.sql）
-    - execute_script(path): 同上，别名
-    - close(): 关闭连接
-    """
     def __init__(self, db_path: str, row_factory: bool = True) -> None:
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        db_dir = os.path.dirname(os.path.abspath(db_path)) or "."
+        os.makedirs(db_dir, exist_ok=True)
         self.conn = sqlite3.connect(db_path)
         if row_factory:
             self.conn.row_factory = sqlite3.Row
         open_db_and_tune(self.conn)
 
-    def init_db(self, schema_path: Optional[str] = None) -> None:
-        if schema_path is None:
-            # 默认从仓库根目录的 schema.sql 读取
-            cwd = os.getcwd()
-            default_path = os.path.join(cwd, "schema.sql")
-            schema_path = default_path
-        self.execute_script(schema_path)
+    def init_db(self, schema: Optional[str] = None, treat_as_sql: Optional[bool] = None) -> None:
+        """
+        初始化数据库结构。参数 schema 可以是：
+        - None: 默认读取当前工作目录的 schema.sql 文件
+        - 路径字符串: 指向 .sql 文件
+        - 原始 SQL 文本: 以 'CREATE TABLE' 等关键字为特征
+        参数 treat_as_sql=True 时强制按 SQL 文本执行；False 时强制按文件路径处理。
+        """
+        if schema is None:
+            default_path = os.path.join(os.getcwd(), "schema.sql")
+            self.execute_script(default_path, treat_as_sql=False)
+            return
+        self.execute_script(schema, treat_as_sql=treat_as_sql)
 
-    def execute_script(self, path: str) -> None:
-        with open(path, "r", encoding="utf-8") as f:
-            sql = f.read()
+    def execute_script(self, path_or_sql: str, treat_as_sql: Optional[bool] = None) -> None:
+        """
+        执行脚本：支持文件路径或直接 SQL 文本。
+        决策规则：
+        - treat_as_sql 显式指定时遵从指定
+        - 否则若存在同名文件则按路径读取
+        - 否则按 SQL 文本直接执行
+        """
+        sql: Optional[str] = None
+        if treat_as_sql is True:
+            sql = path_or_sql
+        elif treat_as_sql is False:
+            if not os.path.isfile(path_or_sql):
+                raise FileNotFoundError(f"schema file not found: {path_or_sql}")
+        else:
+            # 自动判定
+            if os.path.isfile(path_or_sql):
+                pass  # 走文件分支
+            else:
+                # 非文件：视为 SQL 文本
+                sql = path_or_sql
+
         cur = self.conn.cursor()
+        if sql is None:
+            with open(path_or_sql, "r", encoding="utf-8") as f:
+                sql = f.read()
         cur.executescript(sql)
         self.conn.commit()
 
-    # 兼容某些调用写法
+    # 兼容用法
     def cursor(self):
         return self.conn.cursor()
 

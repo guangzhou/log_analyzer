@@ -8,7 +8,7 @@ from .pass2 import run_pass2
 from .summary_agg import merge_to_summary
 def init_db(db: Database):
     for ddl in ALL_TABLE_DDL:
-        db.executescript(ddl)
+        db.execute_script(ddl)
 def main():
     p=argparse.ArgumentParser(description='日志规则演进 与 统计管线')
     p.add_argument('--config', required=True)

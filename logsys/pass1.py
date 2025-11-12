@@ -1,10 +1,14 @@
 # logsys/pass1.py
+"""
+自包含版本：去掉对 preprocess 的依赖，内置 read_gz_lines 与 normalize_lines，
+以修复 ImportError: cannot import name 'read_gz_lines' / 'normalize_lines'。
+"""
 
 from __future__ import annotations
 import re
+import gzip
 import sqlite3
-from typing import Dict, List, Optional, Set, Tuple
-from .preprocess import read_gz_lines, normalize_lines
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 from .db import (
     open_db_and_tune,
     upsert_module_bulk,
@@ -27,11 +31,46 @@ try:
 except Exception:  # noqa: BLE001
     PASS1_UNIQUE = PASS1_MATCHED = PASS1_BUFFERED = None  # type: ignore
 
-# 轻量抽取用的正则
+# === 预处理：读 gz 与合并非时间戳开头行 ======================================
+
+_TS_PREFIX = re.compile(r"^\[\d{8}_\d{6}\]")
+
+def read_gz_lines(gz_path: str, encoding: str = "utf-8") -> Iterator[str]:
+    """流式读取 .gz 文本文件，逐行返回。"""
+    with gzip.open(gz_path, "rt", encoding=encoding, errors="replace") as f:
+        for line in f:
+            yield line.rstrip("\n")
+
+def normalize_lines(lines: Iterable[str]) -> Iterator[str]:
+    """
+    规整：把非时间戳开头的行，去掉回车后加空格拼到上一行，保证“一行一日志”。
+    """
+    buf: Optional[str] = None
+    for raw in lines:
+        s = raw.strip()
+        if not s:
+            # 空行直接跳过
+            continue
+        if _TS_PREFIX.match(s):
+            # 新日志开头
+            if buf is not None:
+                yield buf
+            buf = s
+        else:
+            # 续行，拼接空格
+            if buf is None:
+                # 极端场景：文件以非时间戳开头行起，直接作为一条
+                buf = s
+            else:
+                buf += " " + s
+    if buf is not None:
+        yield buf
+
+# === 轻量抽取与标准化 =======================================================
+
 MOD_RE  = re.compile(r"\[MOD:([^\]]+)\]")
 SMOD_RE = re.compile(r"\[SMOD:([^\]]+)\]")
 
-# 标准化正则 可按你的规范继续补充
 NUM_RE  = re.compile(r"\b\d+(?:\.\d+)?\b")
 HEX_RE  = re.compile(r"\b0x[0-9a-fA-F]+\b")
 PATH_RE = re.compile(r"(?:/[A-Za-z0-9_\-\.]+)+")
@@ -68,7 +107,9 @@ def normalize_key_text(s: str) -> str:
     s = PATH_RE.sub("<PATH>", s)
     return " ".join(s.split())
 
-def buffer_unmatched_for_llm(db: sqlite3.Connection, samples: List[Sample], threshold: int) -> None:
+# === 入缓冲 ================================================================
+
+def buffer_unmatched_for_llm(db: sqlite3.Connection, samples: List['Sample'], threshold: int) -> None:
     """
     最小入缓冲实现：把未命中样本批量写入 BUFFER_ITEM。
     触发 LLM 的阈值与任务编排由下游定时任务处理。
@@ -89,7 +130,6 @@ def buffer_unmatched_for_llm(db: sqlite3.Connection, samples: List[Sample], thre
         )
         buffer_id = cur.lastrowid
         current_size = 0
-        size_thr = threshold
 
     to_ins = []
     for s in samples:
@@ -103,6 +143,8 @@ def buffer_unmatched_for_llm(db: sqlite3.Connection, samples: List[Sample], thre
     current_size += len(to_ins)
     cur.execute("UPDATE BUFFER_GROUP SET current_size = ? WHERE buffer_id = ?", (current_size, buffer_id))
     db.commit()
+
+# === Pass1 主流程 ===========================================================
 
 def run_pass1(gz_path: str, db: sqlite3.Connection, cfg: dict) -> None:
     """
