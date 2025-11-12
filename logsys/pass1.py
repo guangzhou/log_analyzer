@@ -1,14 +1,16 @@
 # logsys/pass1.py
 """
-自包含版本：去掉对 preprocess 的依赖，内置 read_gz_lines 与 normalize_lines，
-以修复 ImportError: cannot import name 'read_gz_lines' / 'normalize_lines'。
+兼容版 run_pass1：签名为 run_pass1(cfg, db, gz_path)
+- 与 logsys.main 中的调用一致
+- db 既可为 Database 实例 也可为 sqlite3.Connection
+- 自包含 read_gz_lines 与 normalize_lines，避免 preprocess 依赖
 """
 
 from __future__ import annotations
 import re
 import gzip
 import sqlite3
-from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple, Any
 from .db import (
     open_db_and_tune,
     upsert_module_bulk,
@@ -22,7 +24,7 @@ from .patterns import (
     try_match_patterns,
 )
 
-# 可选指标埋点 不强依赖
+# 可选指标埋点
 try:
     from prometheus_client import Counter  # type: ignore
     PASS1_UNIQUE = Counter("pass1_unique_norms", "Pass1 唯一 normalized 关键文本数量")
@@ -49,17 +51,13 @@ def normalize_lines(lines: Iterable[str]) -> Iterator[str]:
     for raw in lines:
         s = raw.strip()
         if not s:
-            # 空行直接跳过
             continue
         if _TS_PREFIX.match(s):
-            # 新日志开头
             if buf is not None:
                 yield buf
             buf = s
         else:
-            # 续行，拼接空格
             if buf is None:
-                # 极端场景：文件以非时间戳开头行起，直接作为一条
                 buf = s
             else:
                 buf += " " + s
@@ -88,10 +86,7 @@ def fast_extract_mod_smod(raw_line: str) -> Tuple[Optional[str], Optional[str]]:
     return (m1.group(1) if m1 else None, m2.group(1) if m2 else None)
 
 def extract_key_text(line: str) -> str:
-    """
-    从规整行中剥去前缀中括号段, 返回关键文本。
-    假定 normalize_lines 已保证一行一日志。
-    """
+    """从规整行中剥去前缀中括号段, 返回关键文本。"""
     last = -1
     idx = line.find("] ")
     while idx != -1:
@@ -109,13 +104,12 @@ def normalize_key_text(s: str) -> str:
 
 # === 入缓冲 ================================================================
 
-def buffer_unmatched_for_llm(db: sqlite3.Connection, samples: List['Sample'], threshold: int) -> None:
+def buffer_unmatched_for_llm(conn: sqlite3.Connection, samples: List['Sample'], threshold: int) -> None:
     """
     最小入缓冲实现：把未命中样本批量写入 BUFFER_ITEM。
     触发 LLM 的阈值与任务编排由下游定时任务处理。
-    你仓库已有完整缓冲流程的话, 可直接替换为现有入队函数。
     """
-    cur = db.cursor()
+    cur = conn.cursor()
     cur.execute(
         "SELECT buffer_id, current_size, size_threshold FROM BUFFER_GROUP WHERE status = '收集中' ORDER BY buffer_id DESC LIMIT 1"
     )
@@ -133,7 +127,6 @@ def buffer_unmatched_for_llm(db: sqlite3.Connection, samples: List['Sample'], th
 
     to_ins = []
     for s in samples:
-        # run_id, timestamp, level 暂留空 视你 schema 可补齐
         to_ins.append((buffer_id, None, None, None, s.key_text, s.key_text))
 
     cur.executemany(
@@ -142,19 +135,31 @@ def buffer_unmatched_for_llm(db: sqlite3.Connection, samples: List['Sample'], th
     )
     current_size += len(to_ins)
     cur.execute("UPDATE BUFFER_GROUP SET current_size = ? WHERE buffer_id = ?", (current_size, buffer_id))
-    db.commit()
+    conn.commit()
 
 # === Pass1 主流程 ===========================================================
 
-def run_pass1(gz_path: str, db: sqlite3.Connection, cfg: dict) -> None:
+def _ensure_conn(db_or_database: Any) -> sqlite3.Connection:
     """
-    第一遍 规则演进
-    只做两件事:
+    兼容 Database 或 sqlite3.Connection。
+    """
+    if isinstance(db_or_database, sqlite3.Connection):
+        return db_or_database
+    # Database 包装类：取其 conn
+    if hasattr(db_or_database, "conn"):
+        return db_or_database.conn  # type: ignore[return-value]
+    raise TypeError("db 参数必须是 sqlite3.Connection 或含 conn 属性的 Database 实例")
+
+def run_pass1(cfg: dict, db: Any, gz_path: str) -> None:
+    """
+    与 logsys.main 的调用签名一致：run_pass1(cfg, db, file)
+    第一遍 规则演进：
       1 批量 upsert MODULE 与 SUBMODULE
       2 对唯一 normalized 关键文本做规则匹配 命中更新模板计数 未命中入缓冲
-    不做逐行统计 不做时间分布 这些放在 Pass2。
+    不做逐行统计 不做时间分布。
     """
-    open_db_and_tune(db)
+    conn = _ensure_conn(db)
+    open_db_and_tune(conn)
 
     uniq_cap = int(cfg.get("pass1_unique_cap", 200_000))
     buffer_threshold = int(cfg.get("buffer_threshold", 100))
@@ -173,7 +178,6 @@ def run_pass1(gz_path: str, db: sqlite3.Connection, cfg: dict) -> None:
         key = extract_key_text(line)
         norm = normalize_key_text(key)
         if norm not in uniq:
-            # 简单容量保护 可替换成落临时表或布隆过滤器策略
             if len(uniq) >= uniq_cap:
                 uniq.pop(next(iter(uniq)))
             uniq[norm] = Sample(key_text=key, mod=mod, smod=smod)
@@ -183,12 +187,12 @@ def run_pass1(gz_path: str, db: sqlite3.Connection, cfg: dict) -> None:
 
     # 批量 upsert 基础表
     if mods:
-        upsert_module_bulk(db, mods)
+        upsert_module_bulk(conn, mods)
     if mod_smods:
-        upsert_smod_bulk(db, mod_smods)
+        upsert_smod_bulk(conn, mod_smods)
 
     # 模板匹配 只针对唯一集合
-    patterns = load_compiled_patterns(db)
+    patterns = load_compiled_patterns(conn)
     index    = build_keyword_index(patterns)
 
     matched_ids: List[int] = []
@@ -203,13 +207,13 @@ def run_pass1(gz_path: str, db: sqlite3.Connection, cfg: dict) -> None:
             unmatched_samples.append(s)
 
     if matched_ids:
-        bump_template_stats_bulk(db, matched_ids)
+        bump_template_stats_bulk(conn, matched_ids)
         if PASS1_MATCHED:
             PASS1_MATCHED.inc(len(matched_ids))
 
     if unmatched_samples:
-        buffer_unmatched_for_llm(db, unmatched_samples, buffer_threshold)
+        buffer_unmatched_for_llm(conn, unmatched_samples, buffer_threshold)
         if PASS1_BUFFERED:
             PASS1_BUFFERED.inc(len(unmatched_samples))
 
-    db.commit()
+    conn.commit()
