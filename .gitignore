@@ -3,5 +3,6 @@ package*/
 
 .vscode
 .venv
+*Identifier
 *pycache*
 w9*

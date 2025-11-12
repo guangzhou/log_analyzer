@@ -1,0 +1,17 @@
+app:
+  db_path: "./logsys.db"
+  time_bucket: "5min"
+  pass2_batch_rows: 10000
+  unmatched_dir: "./unmatched"
+
+llm:
+  enabled: true
+  provider: "openai"
+  model: "gpt-4o-mini"
+  api_base: "https://api.openai.com/v1"
+  api_key_env: "OPENAI_API_KEY"
+  timeout_sec: 60
+  prompt_version: "v1.0"
+  n_samples_per_task: 20
+  max_prompt_samples: 50
+  prompt_path: "./prompts/cluster_template_zh_v1.txt"

@@ -1,0 +1,22 @@
+你是一名高级日志规则抽取专家。请你阅读若干条“关键日志内容”样本，输出紧凑 JSON 数组（不换行不美化）。
+要求：
+- 仅输出 JSON 数组文本，不要输出其他说明。
+- 每个对象必须包含字段：分类、推荐方案、匹配规则、典型日志、mod、smod、出现次数。
+- 推荐方案：仅当日志级别为错误或严重时填写，否则为空字符串。
+- 匹配规则：必须是可用正则，尽量针对“关键日志内容”，不要包含前置的方括号字段。
+- 典型日志：从样本中挑选最能代表该类的一条原始行（关键内容或原行均可）。
+- mod 与 smod：若无法确定可置空字符串，但不要省略字段。
+- 出现次数：该类在样本中的条数。
+
+示例输入样本：
+<samples>
+- invalid by too close to real merge cross ...[Process, 951, /home/.../fusion_map.cpp]
+- get GetNextOrPreLeftMost err ! 17219637851010, size 2[GetNextOrPreLeftOrRightMost, 264, /home/.../sdmap_helper.h]
+
+示例输出：
+[{"分类":"融合地图定位错误","推荐方案":"检查融合地图与定位输入质量","匹配规则":".*FusionMap.*invalid.*","典型日志":"invalid by too close to real merge cross ...[Process, 951, /home/.../fusion_map.cpp]","mod":"","smod":"","出现次数":1},
+{"分类":"左右车道检索错误","推荐方案":"检查 sdmap_helper 中左右最外侧车道检索逻辑与输入索引","匹配规则":"get GetNextOrPreLeftMost err.*size <NUM>\[GetNextOrPreLeftOrRightMost.*","典型日志":"get GetNextOrPreLeftMost err ! 17219637851010, size 2[GetNextOrPreLeftOrRightMost, 264, /home/.../sdmap_helper.h]","mod":"","smod":"","出现次数":1}]
+
+现在请对下列样本进行聚类并输出（按上述 JSON 规范）：
+<samples>
+{SAMPLES}
