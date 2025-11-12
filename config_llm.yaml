@@ -4,14 +4,29 @@ app:
   pass2_batch_rows: 10000
   unmatched_dir: "./unmatched"
 
+# llm:
+#   enabled: true
+#   provider: "OpenAI Compatible"
+#   model: "glm-4.6"
+#   api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+#   api_key_env: ZHIPU_API_KEY
+#   timeout_sec: 60
+ 
+
 llm:
-  enabled: true
-  provider: "openai"
-  model: "gpt-4o-mini"
-  api_base: "https://api.openai.com/v1"
-  api_key_env: "OPENAI_API_KEY"
-  timeout_sec: 60
+  provider: openai_compatible      # 代码里常见的“openai 兼容”分支
+  api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: ZHIPU_API_KEY       # 这里写“环境变量名”，不是密钥本身
+  model: glm-4.6                # 你的 GLM-4.6 实际兼容名（例：glm-4-plus / glm-4-air）
+  timeout: 60
+  max_tokens: 4096
+  temperature: 0.2
+  top_p: 0.95
   prompt_version: "v1.0"
-  n_samples_per_task: 20
-  max_prompt_samples: 50
+  n_samples_per_task: 50
+  max_prompt_samples: 100
   prompt_path: "./prompts/cluster_template_zh_v1.txt"
+  # 可选：是否强制 JSON 输出、重试策略等
+  extra:
+    response_format: text
+    retries: 2

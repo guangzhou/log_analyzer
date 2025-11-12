@@ -4,13 +4,15 @@ app:
   pass2_batch_rows: 10000
   unmatched_dir: "./unmatched"
 
-llm:
-  enabled: false
-  provider: "openai"
-  model: "gpt-4o-mini"
-  api_base: "https://api.openai.com/v1"
-  api_key_env: "OPENAI_API_KEY"
+llm: 
+
+  enabled: true
+  provider: "OpenAI Compatible"
+  model: "glm-4.6"
+  api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  api_key_env: api_key_env
   timeout_sec: 60
   prompt_version: "v1.0"
-  n_samples_per_task: 3
-
+  n_samples_per_task: 20000
+  max_prompt_samples: 50000
+  prompt_path: "./prompts/cluster_template_zh_v1.txt"
