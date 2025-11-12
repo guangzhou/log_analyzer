@@ -1,73 +1,173 @@
-# -*- coding: utf-8 -*-
-from typing import List, Tuple
-from datetime import datetime
-import json
-from .ingest import read_gz_lines
-from .preprocess import normalize_lines
-from .parser import parse_line
-from .key_extract import extract_key_text, normalize_key_text
-from .dedup import sort_and_dedup
-from .matcher import TemplateMatcher
-from .buffer_mgr import BufferManager
-from .llm_adapter import call_llm
-from .template_mgr import TemplateManager
-from .db import Database
-def _start(db: Database, file_id:int, cfg_json:str) -> int:
-    now=datetime.utcnow().isoformat()
-    return db.execute('INSERT INTO RUN_SESSION(file_id, pass_type, config_json, started_at, status) VALUES(?,?,?,?,?)', (file_id,'PASS1',cfg_json,now,'运行中'))
-def _end(db: Database, run_id:int, totals:dict):
-    now=datetime.utcnow().isoformat()
-    db.execute('UPDATE RUN_SESSION SET ended_at=?, total_lines=?, preprocessed_lines=?, matched_lines=?, unmatched_lines=?, status=? WHERE run_id=?', (now, totals.get('total',0), totals.get('pre',0), totals.get('matched',0), totals.get('unmatched',0), '成功', run_id))
-def upsert_module(db: Database, mod:str):
-    if not mod: return
-    now=datetime.utcnow().isoformat()
-    db.execute('INSERT OR IGNORE INTO MODULE(mod, description, created_at, updated_at) VALUES(?,?,?,?)', (mod, None, now, now))
-def upsert_smod(db: Database, mod:str, smod:str):
-    if not smod: return
-    now=datetime.utcnow().isoformat()
-    if mod: upsert_module(db, mod)
-    db.execute('INSERT OR IGNORE INTO SUBMODULE(smod, mod, description, created_at, updated_at) VALUES(?,?,?,?,?)', (smod, mod, None, now, now))
-def run_pass1(cfg:dict, db:Database, gz_path:str):
-    file_id = db.execute('INSERT INTO FILE_REGISTRY(path, status, ingested_at) VALUES(?,?,?)', (gz_path, '新', datetime.utcnow().isoformat()))
-    run_id = _start(db, file_id, json.dumps(cfg, ensure_ascii=False))
-    totals={'total':0,'pre':0,'matched':0,'unmatched':0}
-    parsed_batch: List[Tuple[str,str,dict]] = []
+# logsys/pass1.py
+
+from __future__ import annotations
+import re
+import sqlite3
+from typing import Dict, List, Optional, Set, Tuple
+from .preprocess import read_gz_lines, normalize_lines
+from .db import (
+    open_db_and_tune,
+    upsert_module_bulk,
+    upsert_smod_bulk,
+    bump_template_stats_bulk,
+)
+from .patterns import (
+    load_compiled_patterns,
+    build_keyword_index,
+    preselect_candidates,
+    try_match_patterns,
+)
+
+# 可选指标埋点 不强依赖
+try:
+    from prometheus_client import Counter  # type: ignore
+    PASS1_UNIQUE = Counter("pass1_unique_norms", "Pass1 唯一 normalized 关键文本数量")
+    PASS1_MATCHED = Counter("pass1_matched_norms", "Pass1 命中模板的唯一样本数")
+    PASS1_BUFFERED = Counter("pass1_buffered_norms", "Pass1 未命中进入缓冲的唯一样本数")
+except Exception:  # noqa: BLE001
+    PASS1_UNIQUE = PASS1_MATCHED = PASS1_BUFFERED = None  # type: ignore
+
+# 轻量抽取用的正则
+MOD_RE  = re.compile(r"\[MOD:([^\]]+)\]")
+SMOD_RE = re.compile(r"\[SMOD:([^\]]+)\]")
+
+# 标准化正则 可按你的规范继续补充
+NUM_RE  = re.compile(r"\b\d+(?:\.\d+)?\b")
+HEX_RE  = re.compile(r"\b0x[0-9a-fA-F]+\b")
+PATH_RE = re.compile(r"(?:/[A-Za-z0-9_\-\.]+)+")
+
+class Sample:
+    __slots__ = ("key_text", "mod", "smod")
+    def __init__(self, key_text: str, mod: Optional[str], smod: Optional[str]) -> None:
+        self.key_text = key_text
+        self.mod = mod
+        self.smod = smod
+
+def fast_extract_mod_smod(raw_line: str) -> Tuple[Optional[str], Optional[str]]:
+    m1 = MOD_RE.search(raw_line)
+    m2 = SMOD_RE.search(raw_line)
+    return (m1.group(1) if m1 else None, m2.group(1) if m2 else None)
+
+def extract_key_text(line: str) -> str:
+    """
+    从规整行中剥去前缀中括号段, 返回关键文本。
+    假定 normalize_lines 已保证一行一日志。
+    """
+    last = -1
+    idx = line.find("] ")
+    while idx != -1:
+        last = idx
+        idx = line.find("] ", last + 2)
+    if last == -1:
+        return line.strip()
+    return line[last + 2 :].strip()
+
+def normalize_key_text(s: str) -> str:
+    s = NUM_RE.sub("<NUM>", s)
+    s = HEX_RE.sub("<HEX>", s)
+    s = PATH_RE.sub("<PATH>", s)
+    return " ".join(s.split())
+
+def buffer_unmatched_for_llm(db: sqlite3.Connection, samples: List[Sample], threshold: int) -> None:
+    """
+    最小入缓冲实现：把未命中样本批量写入 BUFFER_ITEM。
+    触发 LLM 的阈值与任务编排由下游定时任务处理。
+    你仓库已有完整缓冲流程的话, 可直接替换为现有入队函数。
+    """
+    cur = db.cursor()
+    cur.execute(
+        "SELECT buffer_id, current_size, size_threshold FROM BUFFER_GROUP WHERE status = '收集中' ORDER BY buffer_id DESC LIMIT 1"
+    )
+    row = cur.fetchone()
+    if row:
+        buffer_id, current_size, size_thr = row
+    else:
+        cur.execute(
+            "INSERT INTO BUFFER_GROUP(scope, mod, smod, size_threshold, current_size, created_at, status) "
+            "VALUES('全局', NULL, NULL, ?, 0, CURRENT_TIMESTAMP, '收集中')",
+            (threshold,),
+        )
+        buffer_id = cur.lastrowid
+        current_size = 0
+        size_thr = threshold
+
+    to_ins = []
+    for s in samples:
+        # run_id, timestamp, level 暂留空 视你 schema 可补齐
+        to_ins.append((buffer_id, None, None, None, s.key_text, s.key_text))
+
+    cur.executemany(
+        "INSERT INTO BUFFER_ITEM(buffer_id, run_id, timestamp, level, key_text, raw_log) VALUES(?, ?, ?, ?, ?, ?)",
+        to_ins,
+    )
+    current_size += len(to_ins)
+    cur.execute("UPDATE BUFFER_GROUP SET current_size = ? WHERE buffer_id = ?", (current_size, buffer_id))
+    db.commit()
+
+def run_pass1(gz_path: str, db: sqlite3.Connection, cfg: dict) -> None:
+    """
+    第一遍 规则演进
+    只做两件事:
+      1 批量 upsert MODULE 与 SUBMODULE
+      2 对唯一 normalized 关键文本做规则匹配 命中更新模板计数 未命中入缓冲
+    不做逐行统计 不做时间分布 这些放在 Pass2。
+    """
+    open_db_and_tune(db)
+
+    uniq_cap = int(cfg.get("pass1_unique_cap", 200_000))
+    buffer_threshold = int(cfg.get("buffer_threshold", 100))
+
+    mods: Set[str] = set()
+    mod_smods: Set[Tuple[str, str]] = set()
+    uniq: Dict[str, Sample] = {}
+
+    # 轻量抽取与唯一集合构建
     for line in normalize_lines(read_gz_lines(gz_path)):
-        totals['total']+=1
-        parsed = parse_line(line)
-        if not parsed: continue
-        totals['pre']+=1
-        upsert_module(db, parsed.get('mod'))
-        upsert_smod(db, parsed.get('mod'), parsed.get('smod'))
-        key_text = extract_key_text(parsed['raw'])
-        norm = normalize_key_text(key_text)
-        parsed_batch.append((norm, key_text, parsed))
-    pairs = sort_and_dedup([(t[0],t[1]) for t in parsed_batch])
-    matcher=TemplateMatcher(db); matcher.load_templates()
-    buf=BufferManager(cfg, db); tpl=TemplateManager(db)
-    for norm, raw_key in pairs:
-        parsed = next((p[2] for p in parsed_batch if p[1]==raw_key), None)
-        if not parsed: continue
-        hit = matcher.match_text(raw_key)
-        if hit:
-            totals['matched']+=1
-            ts = parsed.get('timestamp') or datetime.utcnow().isoformat()
-            db.execute('UPDATE REGEX_TEMPLATE SET match_count=match_count+1, last_seen=? WHERE template_id=?', (datetime.utcnow().isoformat(), hit['template_id']))
-            tpl.observe(hit['template_id'], parsed.get('mod') or '', parsed.get('smod') or '', ts)
+        mod, smod = fast_extract_mod_smod(line)
+        if mod:
+            mods.add(mod)
+            if smod:
+                mod_smods.add((mod, smod))
+        key = extract_key_text(line)
+        norm = normalize_key_text(key)
+        if norm not in uniq:
+            # 简单容量保护 可替换成落临时表或布隆过滤器策略
+            if len(uniq) >= uniq_cap:
+                uniq.pop(next(iter(uniq)))
+            uniq[norm] = Sample(key_text=key, mod=mod, smod=smod)
+
+    if PASS1_UNIQUE:
+        PASS1_UNIQUE.inc(len(uniq))
+
+    # 批量 upsert 基础表
+    if mods:
+        upsert_module_bulk(db, mods)
+    if mod_smods:
+        upsert_smod_bulk(db, mod_smods)
+
+    # 模板匹配 只针对唯一集合
+    patterns = load_compiled_patterns(db)
+    index    = build_keyword_index(patterns)
+
+    matched_ids: List[int] = []
+    unmatched_samples: List[Sample] = []
+
+    for norm, s in uniq.items():
+        cands = preselect_candidates(norm, index)
+        tid = try_match_patterns(norm, cands, patterns)
+        if tid is not None:
+            matched_ids.append(tid)
         else:
-            totals['unmatched']+=1
-            bid = buf.append_unmatched(run_id, parsed, raw_key, parsed['raw'])
-            db.execute('INSERT INTO UNMATCHED_LOG(run_id,mod,smod,level,thread_id,timestamp,key_text,raw_log,buffered,buffer_id,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)', (run_id, parsed.get('mod'), parsed.get('smod'), parsed.get('level'), parsed.get('thread_id'), parsed.get('timestamp'), raw_key, parsed['raw'], 1, bid, 'no_match'))
-    if buf.ready():
-        items = buf.drain()
-        if items:
-            task_id = db.execute('INSERT INTO LLM_TASK(buffer_id, model, prompt_version, started_at, status, input_count) VALUES(?,?,?,?,?,?)', (items[0]['buffer_id'], cfg['llm']['model'], cfg['llm']['prompt_version'], datetime.utcnow().isoformat(), '运行中', len(items)))
-            sample_texts = [s['key_text'] for s in items]
-            llm_items = call_llm(cfg, sample_texts)
-            if llm_items:
-                tpl.upsert_from_llm(items[0]['buffer_id'], task_id, llm_items)
-                db.execute('UPDATE LLM_TASK SET status=?, finished_at=?, output_json=? WHERE llm_task_id=?', ('成功', datetime.utcnow().isoformat(), json.dumps(llm_items, ensure_ascii=False), task_id))
-            else:
-                db.execute('UPDATE LLM_TASK SET status=?, finished_at=?, error=? WHERE llm_task_id=?', ('失败', datetime.utcnow().isoformat(), 'LLM 返回空或失败', task_id))
-            buf.clear(items[0]['buffer_id'])
-    _end(db, run_id, totals)
+            unmatched_samples.append(s)
+
+    if matched_ids:
+        bump_template_stats_bulk(db, matched_ids)
+        if PASS1_MATCHED:
+            PASS1_MATCHED.inc(len(matched_ids))
+
+    if unmatched_samples:
+        buffer_unmatched_for_llm(db, unmatched_samples, buffer_threshold)
+        if PASS1_BUFFERED:
+            PASS1_BUFFERED.inc(len(unmatched_samples))
+
+    db.commit()
