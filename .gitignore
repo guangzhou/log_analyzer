@@ -3,5 +3,5 @@ package*/
 
 .vscode
 .venv
- 
+*pycache*
 w9*

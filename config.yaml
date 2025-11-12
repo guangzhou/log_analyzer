@@ -2,7 +2,7 @@ app:
   db_path: "./logsys.db"
   time_bucket: "5min"
   pass2_batch_rows: 10000
-  unmatched_dir: "/mnt/data/logsys_full2/unmatched"
+  unmatched_dir: "./unmatched"
 
 llm:
   enabled: false
@@ -13,3 +13,4 @@ llm:
   timeout_sec: 60
   prompt_version: "v1.0"
   n_samples_per_task: 3
+
