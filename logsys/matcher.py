@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import re
 from typing import List, Dict, Optional
-from db import Database
+# from db import Database
+from .db import Database
 
 class TemplateMatcher:
     """正则模板匹配器"""
