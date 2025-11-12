@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from typing import List, Dict
 from datetime import datetime
-from db import Database
+from .db import Database
 
 class BufferManager:
     """
